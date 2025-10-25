@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Streaming Letters Demo</title>
+  </head>
+  <body>
+    <button id="startButton" type="button">Start</button>
+    <canvas id="streamCanvas"></canvas>
+    <script type="module">
+      (() => {
+        const button = document.getElementById('startButton');
+        const canvas = document.getElementById('streamCanvas');
+        const ctx = canvas.getContext('2d');
+
+        if (!ctx) {
+          console.error('Unable to acquire 2D context.');
+          if (button) {
+            button.disabled = true;
+          }
+          return;
+        }
+
+        const logTimestamp = () => new Date().toISOString();
+        const log = (...args) => console.log(`[${logTimestamp()}]`, ...args);
+        const warn = (...args) => console.warn(`[${logTimestamp()}]`, ...args);
+        const error = (...args) => console.error(`[${logTimestamp()}]`, ...args);
+
+        const config = {
+          fontSize: 24,
+          fontFamily: 'monospace',
+          background: '#030712',
+          foreground: '#f8fafc',
+          clusterColors: [
+            '#facc15',
+            '#38bdf8',
+            '#f472b6',
+            '#34d399',
+            '#a78bfa',
+            '#fb7185',
+          ],
+          railPadding: 24,
+          railFraction: 0.12,
+          lineHeightMultiplier: 1.4,
+        };
+
+        const state = {
+          clusters: [],
+          clusterMap: new Map(),
+          activeCluster: null,
+          recognition: null,
+          isListening: false,
+          keepListening: false,
+          lastFrameTime: performance.now(),
+          metrics: {
+            width: window.innerWidth || 0,
+            height: window.innerHeight || 0,
+            glyphWidth: 12,
+            railY: 40,
+            dpr: window.devicePixelRatio || 1,
+          },
+          colorCursor: 0,
+        };
+
+        const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+
+        const withGlyphWidth = () =>
+          state.metrics.glyphWidth && state.metrics.glyphWidth > 0
+            ? state.metrics.glyphWidth
+            : 12;
+
+        const nextClusterColor = () => {
+          const palette = config.clusterColors;
+          if (!Array.isArray(palette) || palette.length === 0) {
+            return config.foreground;
+          }
+          const color = palette[state.colorCursor % palette.length];
+          state.colorCursor += 1;
+          return color;
+        };
+
+        const updateButtonUI = ({ disabled, label } = {}) => {
+          if (!button) {
+            return;
+          }
+          if (typeof label === 'string') {
+            button.textContent = label;
+          } else {
+            button.textContent = state.isListening ? 'Stop' : 'Start';
+          }
+          if (typeof disabled === 'boolean') {
+            button.disabled = disabled;
+          }
+        };
+
+        updateButtonUI();
+
+        const layoutClusters = () => {
+          const lineHeight = config.fontSize * (config.lineHeightMultiplier || 1.4);
+          const finalClusters = [];
+          const unfinishedClusters = [];
+
+          state.clusters.forEach((cluster) => {
+            if (typeof cluster.x !== 'number') {
+              cluster.x = config.railPadding;
+            }
+            if (cluster.isFinal) {
+              finalClusters.push(cluster);
+            } else {
+              unfinishedClusters.push(cluster);
+            }
+          });
+
+          const lineCount = finalClusters.length + (unfinishedClusters.length ? 1 : 0);
+          const totalHeight = lineCount * lineHeight;
+          const baseY = Math.max(
+            state.metrics.height - totalHeight - config.fontSize,
+            config.fontSize
+          );
+
+          let currentY = baseY;
+          finalClusters.forEach((cluster) => {
+            cluster.railY = currentY;
+            cluster.y = currentY;
+            cluster.x = config.railPadding;
+            currentY += lineHeight;
+          });
+
+          if (unfinishedClusters.length) {
+            const unfinishedY = currentY;
+            let currentX = config.railPadding;
+            unfinishedClusters.forEach((cluster) => {
+              cluster.railY = unfinishedY;
+              cluster.y = unfinishedY;
+              cluster.x = currentX;
+
+              const text = cluster.displayText || cluster.text || '';
+              const measured = ctx.measureText(text).width;
+              const advance = (measured > 0 ? measured : text.length * withGlyphWidth())
+                + config.fontSize;
+              currentX += advance;
+            });
+          }
+        };
+
+        const setCanvasSize = () => {
+          const dpr = window.devicePixelRatio || 1;
+          const width = window.innerWidth;
+          const height = window.innerHeight;
+
+          canvas.width = Math.round(width * dpr);
+          canvas.height = Math.round(height * dpr);
+          canvas.style.width = `${width}px`;
+          canvas.style.height = `${height}px`;
+
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.font = `${config.fontSize}px ${config.fontFamily}`;
+          ctx.textBaseline = 'top';
+          ctx.textAlign = 'left';
+
+          const glyphWidth = ctx.measureText('M').width || 12;
+          const railY = Math.max(config.fontSize * 2, height * config.railFraction);
+
+          state.metrics = {
+            width,
+            height,
+            glyphWidth,
+            railY,
+            dpr,
+          };
+
+          layoutClusters();
+        };
+
+        setCanvasSize();
+        window.addEventListener('resize', setCanvasSize);
+
+        const drawBackground = () => {
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = config.background;
+          ctx.fillRect(0, 0, state.metrics.width, state.metrics.height);
+          ctx.fillStyle = config.foreground;
+        };
+
+        const drawLetter = (ch, x, y, opacity, color) => {
+          if (!ch || opacity <= 0) {
+            return;
+          }
+          ctx.globalAlpha = clamp(opacity, 0, 1);
+          if (color) {
+            ctx.fillStyle = color;
+          }
+          ctx.fillText(ch, x, y);
+        };
+
+        const createCluster = (segId, options = {}) => ({
+          id: segId,
+          x: options.x ?? config.railPadding,
+          y: options.y ?? state.metrics.railY,
+          railY: options.railY ?? state.metrics.railY,
+          text: '',
+          finalText: '',
+          finalRaw: '',
+          interimText: '',
+          interimRaw: '',
+          displayText: '',
+          isFinal: false,
+          color:
+            typeof options.color === 'string' && options.color
+              ? options.color
+              : nextClusterColor(),
+        });
+
+        const drawCluster = (cluster) => {
+          const glyphWidth = withGlyphWidth();
+          const finalText = cluster.finalText || '';
+          const interimText = cluster.isFinal ? '' : cluster.interimText || '';
+          const finalDisplay = cluster.finalRaw || '';
+          const interimDisplay = cluster.isFinal ? '' : cluster.interimRaw || '';
+          if (!finalDisplay && !interimDisplay) {
+            return;
+          }
+          const baseX = cluster.x ?? config.railPadding;
+          const y = cluster.y ?? cluster.railY;
+          const color = cluster.color || config.foreground;
+          ctx.globalAlpha = 1;
+          if (finalDisplay) {
+            drawLetter(finalDisplay, baseX, y, 1, color);
+          }
+          if (interimDisplay) {
+            drawLetter(
+              interimDisplay,
+              baseX + finalText.length * glyphWidth,
+              y,
+              0.6,
+              color
+            );
+            ctx.globalAlpha = 1;
+          }
+        };
+
+        const render = (now) => {
+          state.lastFrameTime = now;
+
+          drawBackground();
+          for (let i = 0; i < state.clusters.length; i += 1) {
+            drawCluster(state.clusters[i]);
+          }
+
+          requestAnimationFrame(render);
+        };
+
+        const SpeechRecognition =
+          window.SpeechRecognition || window.webkitSpeechRecognition;
+
+        const resetScene = () => {
+          state.clusters = [];
+          state.clusterMap.clear();
+          state.activeCluster = null;
+          state.colorCursor = 0;
+          layoutClusters();
+        };
+
+        const updateClusterFromResult = (cluster, transcript, isFinal) => {
+          const normalized = transcript.toLowerCase();
+
+          if (isFinal) {
+            if (
+              !cluster.isFinal ||
+              cluster.finalText !== normalized ||
+              cluster.finalRaw !== transcript
+            ) {
+              cluster.finalText = normalized;
+              cluster.finalRaw = transcript;
+              cluster.interimText = '';
+              cluster.interimRaw = '';
+            }
+          } else {
+            if (cluster.isFinal) {
+              cluster.finalText = '';
+              cluster.finalRaw = '';
+            }
+            if (
+              cluster.interimText !== normalized ||
+              cluster.interimRaw !== transcript
+            ) {
+              cluster.interimText = normalized;
+              cluster.interimRaw = transcript;
+            }
+          }
+
+          cluster.isFinal = isFinal;
+          cluster.text = cluster.finalText + (cluster.isFinal ? '' : cluster.interimText);
+          cluster.displayText =
+            (cluster.finalRaw || '') +
+            (cluster.isFinal ? '' : cluster.interimRaw || '');
+        };
+
+        const handleResultEvent = (event) => {
+          const segments = [];
+          for (let i = 0; i < event.results.length; i += 1) {
+            const result = event.results[i];
+            if (!result || !result[0]) {
+              segments.push({
+                index: i,
+                transcript: '',
+                normalized: '',
+                isFinal: result ? result.isFinal === true : false,
+              });
+              continue;
+            }
+            const transcript = result[0].transcript || '';
+            segments.push({
+              index: i,
+              transcript,
+              normalized: transcript.toLowerCase(),
+              isFinal: result.isFinal === true,
+            });
+          }
+
+          if (!segments.length) {
+            return;
+          }
+
+          const oldClusters = state.clusters.slice();
+          const oldMap = new Map();
+          const oldSnapshots = new Map();
+          const consumedChars = new Map();
+
+          oldClusters.forEach((cluster) => {
+            oldMap.set(cluster.id, cluster);
+            consumedChars.set(cluster.id, 0);
+            oldSnapshots.set(cluster.id, {
+              normalized: (cluster.text || '').toLowerCase(),
+              position: {
+                x: cluster.x,
+                y: cluster.y,
+                railY: cluster.railY,
+              },
+            });
+          });
+
+          const usedOldClusters = new Set();
+          const plans = [];
+
+          const attemptSplitFromSource = (sourceId, charCount, normalizedText) => {
+            if (!oldSnapshots.has(sourceId)) {
+              return null;
+            }
+            const snapshot = oldSnapshots.get(sourceId);
+            const sourceCluster = oldMap.get(sourceId);
+            if (!snapshot || !sourceCluster) {
+              return null;
+            }
+            const totalChars = snapshot.normalized.length;
+            const alreadyUsed = consumedChars.get(sourceId) ?? 0;
+            if (alreadyUsed >= totalChars || !charCount) {
+              return null;
+            }
+            if (alreadyUsed + charCount > totalChars) {
+              return null;
+            }
+            const slice = snapshot.normalized.slice(
+              alreadyUsed,
+              alreadyUsed + charCount
+            );
+            if (slice !== normalizedText) {
+              return null;
+            }
+            const startIndex = alreadyUsed;
+            const endIndex = alreadyUsed + charCount;
+            consumedChars.set(sourceId, endIndex);
+            return {
+              position: {
+                x:
+                  (snapshot.position?.x ?? config.railPadding) +
+                  startIndex * withGlyphWidth(),
+                y: snapshot.position?.y ?? state.metrics.railY,
+                railY: snapshot.position?.railY ?? state.metrics.railY,
+              },
+            };
+          };
+
+          segments.forEach((segment) => {
+            const normalized = segment.normalized;
+            const charCount = normalized.length;
+            const plan = {
+              index: segment.index,
+              transcript: segment.transcript,
+              normalized,
+              isFinal: segment.isFinal,
+              cluster: null,
+              initialPosition: null,
+              color: null,
+            };
+
+            const existing = oldMap.get(segment.index);
+            if (existing && !usedOldClusters.has(segment.index)) {
+              plan.cluster = existing;
+              plan.initialPosition = {
+                x: existing.x,
+                y: existing.y,
+                railY: existing.railY,
+              };
+              plan.color = existing.color || nextClusterColor();
+              usedOldClusters.add(segment.index);
+              const snapshot = oldSnapshots.get(segment.index);
+              const availableLength = snapshot ? snapshot.normalized.length : 0;
+              consumedChars.set(
+                segment.index,
+                Math.min(charCount, availableLength)
+              );
+            } else if (segment.index > 0) {
+              let splitInfo = null;
+              for (let source = segment.index - 1; source >= 0; source -= 1) {
+                splitInfo = attemptSplitFromSource(source, charCount, normalized);
+                if (splitInfo) {
+                  usedOldClusters.add(source);
+                  break;
+                }
+              }
+              if (splitInfo) {
+                plan.initialPosition = splitInfo.position;
+                plan.color = nextClusterColor();
+              } else {
+                plan.initialPosition = {
+                  x: config.railPadding,
+                  y: state.metrics.railY,
+                  railY: state.metrics.railY,
+                };
+                plan.color = nextClusterColor();
+              }
+            } else {
+              plan.initialPosition = {
+                x: config.railPadding,
+                y: state.metrics.railY,
+                railY: state.metrics.railY,
+              };
+              plan.color = nextClusterColor();
+            }
+
+            plans.push(plan);
+          });
+
+          oldClusters
+            .map((cluster) => cluster.id)
+            .filter((id) => !usedOldClusters.has(id))
+            .forEach((orphanId) => {
+              if (!plans.length) {
+                return;
+              }
+              const targetIndex = Math.min(orphanId, plans.length - 1);
+              const plan = plans[targetIndex];
+              const orphanCluster = oldMap.get(orphanId);
+              if (!plan) {
+                return;
+              }
+              if (orphanCluster) {
+                orphanCluster.y = orphanCluster.railY;
+              }
+            });
+
+          plans.sort((a, b) => a.index - b.index);
+
+          const newClusters = [];
+          const newMap = new Map();
+          let latestActive = null;
+
+          plans.forEach((plan) => {
+            let cluster = plan.cluster;
+            if (cluster) {
+              cluster.id = plan.index;
+              cluster.x = plan.initialPosition?.x ?? cluster.x;
+              cluster.y = plan.initialPosition?.y ?? cluster.y;
+              cluster.railY = plan.initialPosition?.railY ?? cluster.railY;
+              if (!cluster.color) {
+                cluster.color = plan.color || nextClusterColor();
+              }
+            } else {
+              cluster = createCluster(plan.index, {
+                x: plan.initialPosition?.x,
+                y: plan.initialPosition?.y,
+                railY: plan.initialPosition?.railY,
+                color: plan.color,
+              });
+            }
+
+            updateClusterFromResult(cluster, plan.transcript, plan.isFinal);
+
+            newClusters.push(cluster);
+            newMap.set(plan.index, cluster);
+            if (!cluster.isFinal) {
+              latestActive = cluster;
+            }
+          });
+
+          state.clusters = newClusters;
+          state.clusterMap = newMap;
+          layoutClusters();
+          state.activeCluster =
+            latestActive ||
+            (newClusters.length ? newClusters[newClusters.length - 1] : null);
+        };
+
+        const setupRecognition = () => {
+          if (!SpeechRecognition) {
+            warn('Web Speech API is not supported in this browser. Demo idle.');
+            updateButtonUI({ label: 'Unsupported', disabled: true });
+            return;
+          }
+
+          const recognition = new SpeechRecognition();
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          recognition.lang = 'en-US';
+
+          recognition.onstart = () => {
+            state.isListening = true;
+            log('Speech recognition started.');
+            resetScene();
+            updateButtonUI({ disabled: false });
+          };
+
+          recognition.onresult = (event) => {
+            try {
+              handleResultEvent(event);
+            } catch (err) {
+              error('Failed to process recognition result:', err);
+            }
+          };
+
+          recognition.onerror = (event) => {
+            error('Speech recognition error:', event.error);
+            if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+              state.keepListening = false;
+              updateButtonUI({ disabled: false });
+            }
+            updateButtonUI();
+          };
+
+          recognition.onend = () => {
+            state.isListening = false;
+            log('Speech recognition stopped.');
+            if (state.keepListening) {
+              updateButtonUI({ disabled: true });
+              try {
+                recognition.start();
+              } catch (err) {
+                error('Unable to restart recognition:', err);
+              }
+            } else {
+              updateButtonUI({ disabled: false });
+            }
+          };
+
+          state.recognition = recognition;
+          updateButtonUI({ disabled: false });
+        };
+
+        const startRecognition = () => {
+          if (!state.recognition) {
+            error('Speech recognition unavailable.');
+            return;
+          }
+          if (state.isListening) {
+            log('Recognition already running.');
+            return;
+          }
+          state.keepListening = true;
+          updateButtonUI({ disabled: true });
+          try {
+            state.recognition.start();
+          } catch (err) {
+            if (err && err.name === 'InvalidStateError') {
+              log('Recognition already active.');
+            } else {
+              state.keepListening = false;
+              error('Failed to start recognition:', err);
+              updateButtonUI({ disabled: false });
+            }
+          }
+        };
+
+        const stopRecognition = () => {
+          if (!state.recognition) {
+            error('Speech recognition unavailable.');
+            return;
+          }
+          if (!state.isListening) {
+            log('Recognition already stopped.');
+            state.keepListening = false;
+            updateButtonUI({ disabled: false });
+            return;
+          }
+          state.keepListening = false;
+          try {
+            state.recognition.stop();
+            updateButtonUI({ disabled: true });
+          } catch (err) {
+            error('Failed to stop recognition:', err);
+            updateButtonUI({ disabled: false });
+          }
+        };
+
+        setupRecognition();
+        if (button) {
+          button.addEventListener('click', () => {
+            if (state.isListening) {
+              stopRecognition();
+            } else {
+              startRecognition();
+            }
+          });
+        }
+
+        state.lastFrameTime = performance.now();
+        requestAnimationFrame(render);
+      })();
+    </script>
+  </body>
+</html>
