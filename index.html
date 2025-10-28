@@ -5,11 +5,36 @@
     <title>Streaming Letters Demo</title>
   </head>
   <body>
-    <button id="startButton" type="button">Start</button>
+      <button id="startButton" type="button">Start</button>
+      <label style="margin-left: 12px; color: #000000; font-family: monospace;">
+        <input id="randomToggle" type="checkbox" checked />
+        Randomize Spawn Offsets
+      </label>
+      <label style="margin-left: 12px; color: #000000; font-family: monospace;">
+        <input id="fragmentBoundsToggle" type="checkbox" />
+        Show Fragment Bounds
+      </label>
+      <label style="margin-left: 12px; color: #000000; font-family: monospace;">
+        <input id="slotBoundsToggle" type="checkbox" />
+        Show Slot Targets
+      </label>
+      <label style="margin-left: 12px; color: #000000; font-family: monospace;">
+        <input id="slotVectorToggle" type="checkbox" />
+        Show Slot Vectors
+      </label>
+      <label style="margin-left: 12px; color: #000000; font-family: monospace;">
+        <input id="colorCodingToggle" type="checkbox" checked />
+        Show Cluster Colors
+      </label>
     <canvas id="streamCanvas"></canvas>
     <script type="module">
       (() => {
         const button = document.getElementById('startButton');
+        const randomToggle = document.getElementById('randomToggle');
+        const fragmentBoundsToggle = document.getElementById('fragmentBoundsToggle');
+        const slotBoundsToggle = document.getElementById('slotBoundsToggle');
+        const slotVectorToggle = document.getElementById('slotVectorToggle');
+        const colorCodingToggle = document.getElementById('colorCodingToggle');
         const canvas = document.getElementById('streamCanvas');
         const ctx = canvas.getContext('2d');
 
@@ -17,6 +42,9 @@
           console.error('Unable to acquire 2D context.');
           if (button) {
             button.disabled = true;
+          }
+          if (colorCodingToggle) {
+            colorCodingToggle.checked = config.colorCodingEnabled;
           }
           return;
         }
@@ -42,6 +70,19 @@
           railPadding: 24,
           railFraction: 0.12,
           lineHeightMultiplier: 1.4,
+          clusterRiseSpeedFinal: 260,
+          clusterRiseSpeedPending: 110,
+          fragmentMaxOffsetX: 110,
+          fragmentMaxOffsetY: 60,
+          fragmentMaxRotation: 0.7,
+          fragmentReturnSpeed: 6,
+          fragmentMoveSpeedMin: 0.85,
+          fragmentMoveSpeedMax: 1.25,
+          fragmentRandomizationEnabled: true,
+          showFragmentBounds: false,
+          showSlotBounds: false,
+          showSlotVectors: false,
+          colorCodingEnabled: true,
         };
 
         const state = {
@@ -52,6 +93,8 @@
           isListening: false,
           keepListening: false,
           lastFrameTime: performance.now(),
+          pendingLineY: null,
+          pendingLineTargetY: null,
           metrics: {
             width: window.innerWidth || 0,
             height: window.innerHeight || 0,
@@ -60,6 +103,13 @@
             dpr: window.devicePixelRatio || 1,
           },
           colorCursor: 0,
+          stream: {
+            entries: [],
+            fragments: new Map(),
+            fading: new Set(),
+            nextId: 0,
+            lastDiff: null,
+          },
         };
 
         const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
@@ -68,6 +118,11 @@
           state.metrics.glyphWidth && state.metrics.glyphWidth > 0
             ? state.metrics.glyphWidth
             : 12;
+
+        const randomBetween = (min, max) => Math.random() * (max - min) + min;
+
+        const isRenderableChar = (ch) =>
+          typeof ch === 'string' && ch.trim().length > 0;
 
         const nextClusterColor = () => {
           const palette = config.clusterColors;
@@ -93,56 +148,165 @@
           }
         };
 
-        updateButtonUI();
-
-        const layoutClusters = () => {
-          const lineHeight = config.fontSize * (config.lineHeightMultiplier || 1.4);
-          const finalClusters = [];
-          const unfinishedClusters = [];
-
-          state.clusters.forEach((cluster) => {
-            if (typeof cluster.x !== 'number') {
-              cluster.x = config.railPadding;
-            }
-            if (cluster.isFinal) {
-              finalClusters.push(cluster);
-            } else {
-              unfinishedClusters.push(cluster);
-            }
-          });
-
-          const lineCount = finalClusters.length + (unfinishedClusters.length ? 1 : 0);
-          const totalHeight = lineCount * lineHeight;
-          const baseY = Math.max(
-            state.metrics.height - totalHeight - config.fontSize,
-            config.fontSize
-          );
-
-          let currentY = baseY;
-          finalClusters.forEach((cluster) => {
-            cluster.railY = currentY;
-            cluster.y = currentY;
-            cluster.x = config.railPadding;
-            currentY += lineHeight;
-          });
-
-          if (unfinishedClusters.length) {
-            const unfinishedY = currentY;
-            let currentX = config.railPadding;
-            unfinishedClusters.forEach((cluster) => {
-              cluster.railY = unfinishedY;
-              cluster.y = unfinishedY;
-              cluster.x = currentX;
-
-              const text = cluster.displayText || cluster.text || '';
-              const measured = ctx.measureText(text).width;
-              const advance = (measured > 0 ? measured : text.length * withGlyphWidth())
-                + config.fontSize;
-              currentX += advance;
-            });
+        const updateToggles = () => {
+          if (randomToggle) {
+            randomToggle.checked = config.fragmentRandomizationEnabled;
+          }
+          if (fragmentBoundsToggle) {
+            fragmentBoundsToggle.checked = config.showFragmentBounds;
+          }
+          if (slotBoundsToggle) {
+            slotBoundsToggle.checked = config.showSlotBounds;
+          }
+          if (slotVectorToggle) {
+            slotVectorToggle.checked = config.showSlotVectors;
           }
         };
 
+        updateButtonUI();
+        updateToggles();
+
+        /**
+         * Assign each cluster a top-aligned target row; unfinished clusters share the
+         * pending band visually but maintain their own distance to the final slot.
+         */
+        const layoutClusters = () => {
+          const lineHeight = config.fontSize * (config.lineHeightMultiplier || 1.4);
+          const topPadding = config.fontSize * 1.25;
+          const spawnY = Math.max(state.metrics.height - config.fontSize * 1.5, topPadding);
+          const previousPendingY =
+            typeof state.pendingLineY === 'number' ? state.pendingLineY : null;
+
+          state.clusters.forEach((cluster, index) => {
+            if (typeof cluster.x !== 'number') {
+              cluster.x = config.railPadding;
+            }
+
+            const finalTargetY = topPadding + index * lineHeight;
+            cluster.finalTargetY = finalTargetY;
+            cluster.railY = finalTargetY;
+
+            if (!cluster.hasSpawned) {
+              const spawnSource =
+                !cluster.isFinal && previousPendingY !== null
+                  ? previousPendingY
+                  : spawnY;
+              cluster.spawnY = spawnSource;
+              cluster.y = spawnSource;
+              cluster.hasSpawned = true;
+            } else if (typeof cluster.spawnY !== 'number') {
+              const spawnSource =
+                !cluster.isFinal && previousPendingY !== null
+                  ? previousPendingY
+                  : typeof cluster.y === 'number'
+                  ? cluster.y
+                  : spawnY;
+              cluster.spawnY = spawnSource;
+              if (typeof cluster.y !== 'number') {
+                cluster.y = spawnSource;
+              }
+            }
+
+            const originY =
+              typeof cluster.spawnY === 'number' ? cluster.spawnY : spawnY;
+            cluster.finalInitialDistance = Math.max(
+              Math.abs(originY - finalTargetY),
+              1
+            );
+          });
+
+          const firstUnfinished = state.clusters.findIndex((cluster) => !cluster.isFinal);
+          const firstPendingCluster =
+            firstUnfinished >= 0 ? state.clusters[firstUnfinished] : null;
+          if (firstUnfinished === -1) {
+            state.pendingLineTargetY = null;
+            state.pendingLineY = null;
+          } else {
+            state.pendingLineTargetY = topPadding + firstUnfinished * lineHeight;
+            if (typeof state.pendingLineY !== 'number') {
+              state.pendingLineY =
+                (firstPendingCluster &&
+                  typeof firstPendingCluster.spawnY === 'number'
+                  ? firstPendingCluster.spawnY
+                  : spawnY);
+            }
+          }
+
+          const glyphWidth = withGlyphWidth();
+          const clusterGap = 0;
+          let pendingCursorX = config.railPadding;
+
+          let pendingColumnCursor = 0;
+          let processedPendingClusters = 0;
+          state.clusters.forEach((cluster) => {
+            const spanLength = Math.max(
+              (cluster.endIndex ?? 0) - (cluster.startIndex ?? 0),
+              0
+            );
+            const spanEntries = state.stream.entries.slice(
+              cluster.startIndex ?? 0,
+              cluster.endIndex ?? 0
+            );
+            let leadingInvisible = 0;
+            while (
+              leadingInvisible < spanEntries.length &&
+              !isRenderableChar(spanEntries[leadingInvisible]?.char)
+            ) {
+              leadingInvisible += 1;
+            }
+            const visibleLength = Math.max(spanLength, 0);
+            cluster.visibleLength = Math.max(visibleLength, 1);
+            const clusterWidth = cluster.visibleLength * glyphWidth;
+            if (cluster.isFinal) {
+              cluster.finalBaseX = config.railPadding;
+              cluster.x = cluster.finalBaseX;
+              cluster.renderOffset = 0;
+              cluster.targetY = cluster.finalTargetY;
+              cluster.pendingTargetY = null;
+              cluster.pendingInitialDistance = null;
+            } else {
+              const pendingTarget =
+                state.pendingLineTargetY ?? cluster.finalTargetY;
+              cluster.pendingBaseX = pendingCursorX;
+              if (processedPendingClusters === 0) {
+                cluster.renderOffset = leadingInvisible;
+                processedPendingClusters += 1;
+              } else {
+                cluster.renderOffset = 0;
+              }
+              cluster.x = cluster.pendingBaseX + cluster.renderOffset * glyphWidth;
+              pendingCursorX = cluster.pendingBaseX + clusterWidth + clusterGap;
+              cluster.targetY = pendingTarget;
+              if (cluster.pendingTargetY !== pendingTarget) {
+                cluster.pendingTargetY = pendingTarget;
+                const originY =
+                  typeof cluster.spawnY === 'number'
+                    ? cluster.spawnY
+                    : typeof cluster.y === 'number'
+                    ? cluster.y
+                    : spawnY;
+                cluster.pendingInitialDistance = Math.max(
+                  Math.abs(originY - pendingTarget),
+                  1
+                );
+              } else if (cluster.pendingInitialDistance == null) {
+                const originY =
+                  typeof cluster.spawnY === 'number'
+                    ? cluster.spawnY
+                    : typeof cluster.y === 'number'
+                    ? cluster.y
+                    : spawnY;
+                cluster.pendingInitialDistance = Math.max(
+                  Math.abs(originY - pendingTarget),
+                  1
+                );
+              }
+            }
+            assignFinalSlots(cluster);
+          });
+        };
+
+        /** Resize the canvas for the current DPR and refresh layout metrics. */
         const setCanvasSize = () => {
           const dpr = window.devicePixelRatio || 1;
           const width = window.innerWidth;
@@ -175,6 +339,7 @@
         setCanvasSize();
         window.addEventListener('resize', setCanvasSize);
 
+        /** Paint the dark background before rendering clusters. */
         const drawBackground = () => {
           ctx.globalAlpha = 1;
           ctx.fillStyle = config.background;
@@ -193,58 +358,577 @@
           ctx.fillText(ch, x, y);
         };
 
-        const createCluster = (segId, options = {}) => ({
-          id: segId,
-          x: options.x ?? config.railPadding,
-          y: options.y ?? state.metrics.railY,
-          railY: options.railY ?? state.metrics.railY,
-          text: '',
-          finalText: '',
-          finalRaw: '',
-          interimText: '',
-          interimRaw: '',
-          displayText: '',
-          isFinal: false,
-          color:
-            typeof options.color === 'string' && options.color
-              ? options.color
-              : nextClusterColor(),
-        });
-
+        /** Render a cluster's fragments and optional debugging bounds. */
         const drawCluster = (cluster) => {
           const glyphWidth = withGlyphWidth();
-          const finalText = cluster.finalText || '';
-          const interimText = cluster.isFinal ? '' : cluster.interimText || '';
-          const finalDisplay = cluster.finalRaw || '';
-          const interimDisplay = cluster.isFinal ? '' : cluster.interimRaw || '';
-          if (!finalDisplay && !interimDisplay) {
+          const entries = state.stream.entries;
+          const span = entries.slice(cluster.startIndex ?? 0, cluster.endIndex ?? 0);
+          if (!span.length) {
+            if (config.showSlotBounds && Array.isArray(cluster.finalSlots)) {
+              cluster.finalSlots.forEach((slot) => {
+                if (!slot) {
+                  return;
+                }
+                ctx.save();
+                ctx.lineWidth = 1;
+                ctx.strokeStyle = 'rgba(255, 0, 0, 0.35)';
+                ctx.strokeRect(slot.x, slot.y, slot.width, slot.height);
+                ctx.restore();
+              });
+            }
             return;
           }
-          const baseX = cluster.x ?? config.railPadding;
-          const y = cluster.y ?? cluster.railY;
-          const color = cluster.color || config.foreground;
-          ctx.globalAlpha = 1;
-          if (finalDisplay) {
-            drawLetter(finalDisplay, baseX, y, 1, color);
+          const color = config.colorCodingEnabled ? cluster.color || config.foreground : config.foreground;
+          const currentY = cluster.y ?? cluster.railY;
+          const occupiedSlots = new Set();
+
+          const renderOffset = cluster.renderOffset ?? 0;
+          span.forEach((entry, idx) => {
+            if (!entry) {
+              return;
+            }
+            const fragment = state.stream.fragments.get(entry.id);
+            const relativeIndex = (entry.canonicalIndex ?? 0) - (cluster.startIndex ?? 0);
+            const renderIndex = relativeIndex - renderOffset;
+            const slot = renderIndex >= 0 ? cluster.finalSlots?.[renderIndex] : null;
+            if (!fragment) {
+              if (slot) {
+                occupiedSlots.add(slot);
+              }
+              return;
+            }
+            const slotX = fragment.isFading && fragment.fadeBaseX != null
+              ? fragment.fadeBaseX
+              : slot
+              ? slot.x
+              : (cluster.x ?? config.railPadding) + renderIndex * glyphWidth;
+            const slotY = fragment.isFading && fragment.fadeBaseY != null
+              ? fragment.fadeBaseY
+              : slot
+              ? slot.y
+              : cluster.targetY ?? currentY;
+            const drawX = slotX + (fragment.offsetX ?? 0);
+            const drawY = currentY + (fragment.offsetY ?? 0);
+            const rotation = fragment.rotation ?? 0;
+
+            ctx.save();
+            ctx.translate(drawX + glyphWidth / 2, drawY + config.fontSize / 2);
+            ctx.rotate(rotation);
+            ctx.translate(-glyphWidth / 2, -config.fontSize / 2);
+            ctx.fillStyle = color;
+            const alpha = fragment.opacity ?? 1;
+            ctx.globalAlpha = clamp(alpha, 0, 1);
+            ctx.fillText(fragment.ch, 0, 0);
+            fragment.lastDrawX = drawX;
+            fragment.lastDrawY = drawY;
+
+            if (slot) {
+              occupiedSlots.add(slot);
+            }
+
+            if (config.showFragmentBounds) {
+              ctx.lineWidth = 1;
+              ctx.strokeStyle = 'rgba(255, 0, 0, 0.65)';
+              ctx.strokeRect(0, 0, glyphWidth, config.fontSize);
+            }
+            ctx.restore();
+
+            if (config.showSlotVectors && slot) {
+              ctx.save();
+              ctx.lineWidth = 1;
+              ctx.strokeStyle = 'rgba(255, 0, 0, 0.35)';
+              ctx.beginPath();
+              ctx.moveTo(drawX + glyphWidth / 2, drawY + config.fontSize / 2);
+              ctx.lineTo(slot.x + glyphWidth / 2, slot.y + config.fontSize / 2);
+              ctx.stroke();
+              ctx.restore();
+            }
+
+            if (config.showSlotBounds && slot) {
+              ctx.save();
+              ctx.lineWidth = 1;
+              ctx.strokeStyle = 'rgba(255, 0, 0, 0.35)';
+              ctx.strokeRect(slot.x, slot.y, slot.width, slot.height);
+              ctx.restore();
+            }
+          });
+
+          if (config.showSlotBounds && Array.isArray(cluster.finalSlots)) {
+            cluster.finalSlots.forEach((slot) => {
+              if (!slot || occupiedSlots.has(slot)) {
+                return;
+              }
+              ctx.save();
+              ctx.lineWidth = 1;
+              ctx.strokeStyle = 'rgba(255, 0, 0, 0.35)';
+              ctx.strokeRect(slot.x, slot.y, slot.width, slot.height);
+              ctx.restore();
+            });
           }
-          if (interimDisplay) {
-            drawLetter(
-              interimDisplay,
-              baseX + finalText.length * glyphWidth,
-              y,
-              0.6,
-              color
+
+          ctx.globalAlpha = 1;
+        };
+
+        /** Compute the fixed final slot positions for each character in a cluster. */
+        const assignFinalSlots = (cluster) => {
+          const glyphWidth = withGlyphWidth();
+          const baseX = cluster.x ?? config.railPadding;
+          const targetY = cluster.isFinal
+            ? (typeof cluster.finalTargetY === 'number'
+                ? cluster.finalTargetY
+                : cluster.railY ?? state.metrics.railY)
+            : (typeof state.pendingLineTargetY === 'number'
+                ? state.pendingLineTargetY
+                : typeof cluster.pendingTargetY === 'number'
+                ? cluster.pendingTargetY
+                : typeof cluster.finalTargetY === 'number'
+                ? cluster.finalTargetY
+                : cluster.railY ?? state.metrics.railY);
+          const spanLength = Math.max(
+            (cluster.endIndex ?? 0) - (cluster.startIndex ?? 0),
+            0
+          );
+          const leadingInvisible = cluster.isFinal ? 0 : (cluster.renderOffset ?? 0);
+          const visibleLength = Math.max(spanLength - leadingInvisible, 0);
+          const slots = [];
+
+          for (let index = 0; index < visibleLength; index += 1) {
+            slots.push({
+              index,
+              x: baseX + index * glyphWidth,
+              y: targetY,
+              width: glyphWidth,
+              height: config.fontSize,
+            });
+          }
+
+          cluster.finalSlots = slots;
+        };
+
+        const ensureFragmentRandomization = (fragment) => {
+          if (!config.fragmentRandomizationEnabled) {
+            fragment.offsetX = 0;
+            fragment.offsetY = 0;
+            fragment.rotation = 0;
+            fragment.speedMultiplier = 1;
+            return;
+          }
+          fragment.offsetX = randomBetween(-config.fragmentMaxOffsetX, config.fragmentMaxOffsetX);
+          fragment.offsetY = randomBetween(-config.fragmentMaxOffsetY, config.fragmentMaxOffsetY);
+          fragment.rotation = randomBetween(-config.fragmentMaxRotation, config.fragmentMaxRotation);
+          fragment.speedMultiplier = randomBetween(
+            config.fragmentMoveSpeedMin,
+            config.fragmentMoveSpeedMax
+          );
+        };
+
+        const spawnFragmentForEntry = (entry) => {
+          if (!isRenderableChar(entry.char)) {
+            return null;
+          }
+          const fragment = {
+            id: entry.id,
+            ch: entry.char,
+            offsetX: 0,
+            offsetY: 0,
+            rotation: 0,
+            speedMultiplier: 1,
+            opacity: 1,
+            isFading: false,
+          };
+          ensureFragmentRandomization(fragment);
+          state.stream.fragments.set(entry.id, fragment);
+          return fragment;
+        };
+
+        const scheduleFragmentFade = (entry) => {
+          if (!entry) {
+            return;
+          }
+          const fragment = state.stream.fragments.get(entry.id);
+          if (!fragment) {
+            return;
+          }
+          if (!fragment.isFading) {
+            fragment.isFading = true;
+            fragment.fadeBaseX = fragment.lastDrawX ?? fragment.fadeBaseX;
+            fragment.fadeBaseY = fragment.lastDrawY ?? fragment.fadeBaseY;
+          }
+          state.stream.fading.add(fragment);
+        };
+
+        const buildSegmentsFromEvent = (event) => {
+          const segments = [];
+          for (let i = 0; i < event.results.length; i += 1) {
+            const result = event.results[i];
+            if (!result || !result[0]) {
+              segments.push({
+                index: i,
+                rawTranscript: '',
+                trimmedTranscript: '',
+                normalized: '',
+                leadingTrim: 0,
+                isFinal: result ? result.isFinal === true : false,
+              });
+              continue;
+            }
+            const rawTranscript = result[0].transcript || '';
+            const trimmedTranscript = rawTranscript.replace(/^\s+/, '');
+            segments.push({
+              index: i,
+              rawTranscript,
+              trimmedTranscript,
+              normalized: trimmedTranscript.toLowerCase(),
+              leadingTrim: Math.max(rawTranscript.length - trimmedTranscript.length, 0),
+              isFinal: result.isFinal === true,
+            });
+          }
+          return segments;
+        };
+
+        const buildStreamDescriptors = (segments) => {
+          const chars = [];
+          const ranges = [];
+          let cursor = 0;
+          segments.forEach((segment) => {
+            const raw = segment.rawTranscript || '';
+            const start = cursor;
+            for (let i = 0; i < raw.length; i += 1) {
+              chars.push({
+                char: raw[i],
+                isFinal: segment.isFinal,
+                segmentIndex: segment.index,
+              });
+              cursor += 1;
+            }
+            ranges.push({
+              index: segment.index,
+              start,
+              end: cursor,
+              isFinal: segment.isFinal,
+              trimmed: segment.trimmedTranscript || '',
+              raw,
+            });
+          });
+          return { chars, ranges };
+        };
+
+        const diffStreamEntries = (descriptors) => {
+          const { chars } = descriptors;
+          const oldEntries = state.stream.entries;
+          const prevChars = oldEntries.map((entry) => entry.char);
+          const nextChars = chars.map((item) => item.char);
+          const lcsPairs = computeLCSPairs(prevChars, nextChars);
+
+          const reusedOld = new Set();
+          const reusedByNew = new Map();
+          lcsPairs.forEach(([oldIdx, newIdx]) => {
+            reusedOld.add(oldIdx);
+            reusedByNew.set(newIdx, oldEntries[oldIdx]);
+          });
+
+          oldEntries.forEach((entry, idx) => {
+            if (!reusedOld.has(idx)) {
+              scheduleFragmentFade(entry);
+            }
+          });
+
+          const newEntries = [];
+          const createdIds = new Set();
+          const reusedIds = new Set();
+          chars.forEach((charInfo, newIdx) => {
+            const existing = reusedByNew.get(newIdx);
+            if (existing) {
+              existing.canonicalIndex = newIdx;
+              existing.segmentIndex = charInfo.segmentIndex;
+              existing.char = charInfo.char;
+              if (charInfo.isFinal) {
+                existing.isFinal = true;
+              }
+              newEntries.push(existing);
+              if (isRenderableChar(existing.char) && !state.stream.fragments.has(existing.id)) {
+                spawnFragmentForEntry(existing);
+              }
+              reusedIds.add(existing.id);
+            } else {
+              const entry = {
+                id: state.stream.nextId,
+                char: charInfo.char,
+                isFinal: !!charInfo.isFinal,
+                segmentIndex: charInfo.segmentIndex,
+                canonicalIndex: newIdx,
+              };
+              state.stream.nextId += 1;
+              newEntries.push(entry);
+              spawnFragmentForEntry(entry);
+              if (isRenderableChar(entry.char)) {
+                createdIds.add(entry.id);
+              }
+            }
+          });
+
+          state.stream.entries = newEntries;
+          state.stream.lastDiff = {
+            createdIds,
+            reusedIds,
+          };
+        };
+
+        /** Emit a console snapshot of current clusters and fragment positions. */
+        const logRecognitionSnapshot = () => {
+          const clusterSummaries = [];
+          const fragmentSummaries = [];
+          state.clusters.forEach((cluster, clusterIdx) => {
+            const currentY =
+              typeof cluster.y === 'number'
+                ? cluster.y
+                : typeof cluster.spawnY === 'number'
+                ? cluster.spawnY
+                : state.metrics.height - config.fontSize * 1.5;
+            const stats = cluster.fragmentStats || { created: 0, reused: 0 };
+            clusterSummaries.push({
+              clusterId: cluster.id,
+              order: clusterIdx,
+              text: cluster.displayText || '',
+              isFinal: cluster.isFinal,
+              x: Math.round((cluster.x ?? config.railPadding) * 100) / 100,
+              y: Math.round(currentY * 100) / 100,
+              fragmentsCreated: stats.created,
+              fragmentsReused: stats.reused,
+            });
+
+            const span = state.stream.entries.slice(
+              cluster.startIndex ?? 0,
+              cluster.endIndex ?? 0
             );
-            ctx.globalAlpha = 1;
+            span.forEach((entry, relIdx) => {
+              const fragment = state.stream.fragments.get(entry.id);
+              if (!fragment) {
+                return;
+              }
+              fragmentSummaries.push({
+                clusterId: cluster.id,
+                fragmentIndex: relIdx,
+                char: entry.char,
+                isFading: !!fragment.isFading,
+                opacity: Math.round((fragment.opacity ?? 1) * 100) / 100,
+                drawX: Math.round((fragment.lastDrawX ?? 0) * 100) / 100,
+                drawY: Math.round((fragment.lastDrawY ?? 0) * 100) / 100,
+              });
+            });
+          });
+
+          try {
+            console.table(clusterSummaries);
+          } catch (err) {
+            console.log('Cluster snapshot', clusterSummaries);
+          }
+          try {
+            console.table(fragmentSummaries);
+          } catch (err) {
+            console.log('Fragment snapshot', fragmentSummaries);
           }
         };
 
+        /**
+         * Ensure the cluster has one fragment per rendered character, optionally applying
+         * randomized offsets/rotation to create a scatter spawn effect.
+         */
+        /** Compute longest common subsequence index pairs between two strings. */
+        const computeLCSPairs = (prev, next) => {
+          const m = prev.length;
+          const n = next.length;
+          const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
+          for (let i = m - 1; i >= 0; i -= 1) {
+            for (let j = n - 1; j >= 0; j -= 1) {
+              if (prev[i] === next[j]) {
+                dp[i][j] = dp[i + 1][j + 1] + 1;
+              } else {
+                dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+              }
+            }
+          }
+
+          const pairs = [];
+          let i = 0;
+          let j = 0;
+          while (i < m && j < n) {
+            if (prev[i] === next[j]) {
+              pairs.push([i, j]);
+              i += 1;
+              j += 1;
+            } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+              i += 1;
+            } else {
+              j += 1;
+            }
+          }
+          return pairs;
+        };
+
+
+        /** Main animation loop advancing clusters and issuing periodic debug logs. */
         const render = (now) => {
+          const deltaSeconds = Math.min(
+            Math.max((now - state.lastFrameTime) / 1000, 0),
+            0.064
+          );
           state.lastFrameTime = now;
 
           drawBackground();
-          for (let i = 0; i < state.clusters.length; i += 1) {
-            drawCluster(state.clusters[i]);
+          if (typeof state.pendingLineTargetY === 'number') {
+            const firstPending = state.clusters.find((cluster) => !cluster.isFinal) || null;
+            if (typeof state.pendingLineY !== 'number') {
+              const spawnSource =
+                (firstPending && typeof firstPending.spawnY === 'number'
+                  ? firstPending.spawnY
+                  : null) ??
+                state.metrics.height - config.fontSize * 1.5;
+              state.pendingLineY = spawnSource;
+            }
+            const dyGroup = state.pendingLineTargetY - state.pendingLineY;
+            if (Math.abs(dyGroup) > 0.5) {
+              const fallbackInitial = Math.abs(dyGroup) || 1;
+              const pendingInitial =
+                firstPending && typeof firstPending.pendingInitialDistance === 'number'
+                  ? firstPending.pendingInitialDistance
+                  : fallbackInitial;
+              const initial = Math.max(pendingInitial, 1);
+              const ratio = clamp(Math.abs(dyGroup) / initial, 0, 1);
+              const speed =
+                config.clusterRiseSpeedPending +
+                (config.clusterRiseSpeedFinal - config.clusterRiseSpeedPending) * (1 - ratio);
+              const groupStep = Math.sign(dyGroup) * speed * deltaSeconds;
+              state.pendingLineY =
+                Math.abs(groupStep) >= Math.abs(dyGroup)
+                  ? state.pendingLineTargetY
+                  : state.pendingLineY + groupStep;
+            } else {
+              state.pendingLineY = state.pendingLineTargetY;
+            }
+          }
+
+          state.clusters.forEach((cluster) => {
+            const targetY =
+              typeof cluster.targetY === 'number' ? cluster.targetY : cluster.railY;
+            if (typeof cluster.y !== 'number') {
+              const spawnSource =
+                typeof cluster.spawnY === 'number'
+                  ? cluster.spawnY
+                  : state.metrics.height - config.fontSize * 1.5;
+              cluster.y = spawnSource;
+            }
+            if (typeof cluster.x !== 'number') {
+              cluster.x = config.railPadding;
+            }
+            if (cluster.isFinal) {
+              if (typeof targetY === 'number') {
+                const dy = targetY - cluster.y;
+                if (Math.abs(dy) > 0.5) {
+                  const initial = Math.max(
+                    cluster.finalInitialDistance || Math.abs(dy),
+                    1
+                  );
+                  const ratio = clamp(Math.abs(dy) / initial, 0, 1);
+                  const speed =
+                    config.clusterRiseSpeedPending +
+                    (config.clusterRiseSpeedFinal - config.clusterRiseSpeedPending) * (1 - ratio);
+                  const step = Math.sign(dy) * speed * deltaSeconds;
+                  cluster.y = Math.abs(step) >= Math.abs(dy) ? targetY : cluster.y + step;
+                } else {
+                  cluster.y = targetY;
+                }
+              }
+            } else if (typeof state.pendingLineY === 'number') {
+              const dy = state.pendingLineY - (cluster.y ?? state.pendingLineY);
+              if (Math.abs(dy) > 0.5) {
+                const initial = Math.max(
+                  cluster.pendingInitialDistance || Math.abs(dy),
+                  1
+                );
+                const ratio = clamp(Math.abs(dy) / initial, 0, 1);
+                const speed =
+                  config.clusterRiseSpeedPending +
+                  (config.clusterRiseSpeedFinal - config.clusterRiseSpeedPending) * (1 - ratio);
+                const step = Math.sign(dy) * speed * deltaSeconds;
+                cluster.y = Math.abs(step) >= Math.abs(dy) ? state.pendingLineY : (cluster.y ?? 0) + step;
+              } else {
+                cluster.y = state.pendingLineY;
+              }
+            }
+
+            const spanEntries = state.stream.entries.slice(
+              cluster.startIndex ?? 0,
+              cluster.endIndex ?? 0
+            );
+            if (spanEntries.length) {
+              const slotTargetY =
+                typeof cluster.finalTargetY === 'number'
+                  ? cluster.finalTargetY
+                  : typeof cluster.targetY === 'number'
+                  ? cluster.targetY
+                  : cluster.railY;
+              const initialDistance = Math.max(
+                cluster.finalInitialDistance || 1,
+                1
+              );
+              const distance = Math.abs((cluster.y ?? 0) - (slotTargetY ?? 0));
+              const ratio = clamp(distance / initialDistance, 0, 1);
+              const baseEase = Math.min(deltaSeconds * config.fragmentReturnSpeed, 1);
+              const easing = config.fragmentRandomizationEnabled
+                ? baseEase * (1 - ratio)
+                : baseEase;
+
+              spanEntries.forEach((entry, relIdx) => {
+                const fragment = state.stream.fragments.get(entry.id);
+                if (!fragment) {
+                  return;
+                }
+                const speedMul = fragment.speedMultiplier ?? 1;
+                if (!config.fragmentRandomizationEnabled) {
+                  fragment.offsetX = 0;
+                  fragment.offsetY = 0;
+                  fragment.rotation = 0;
+                  fragment.speedMultiplier = 1;
+                } else if (easing > 0) {
+                  fragment.offsetX -= fragment.offsetX * easing * speedMul;
+                  fragment.offsetY -= fragment.offsetY * easing * speedMul;
+                  fragment.rotation -= fragment.rotation * easing * speedMul;
+                }
+
+                if (fragment.isFading) {
+                  fragment.opacity =
+                    fragment.opacity != null
+                      ? fragment.opacity - Math.max(baseEase * 3, 0.5)
+                      : 0;
+                } else {
+                  fragment.opacity = Math.min(1, fragment.opacity ?? 1);
+                }
+
+                if (fragment.opacity <= 0) {
+                  state.stream.fragments.delete(entry.id);
+                  state.stream.fading.delete(fragment);
+                }
+              });
+            }
+
+            drawCluster(cluster);
+          });
+
+          if (state.stream.fading.size) {
+            const removals = [];
+            state.stream.fading.forEach((fragment) => {
+              fragment.opacity =
+                (fragment.opacity ?? 1) - deltaSeconds * config.fragmentReturnSpeed * 3;
+              if (fragment.opacity <= 0) {
+                removals.push(fragment);
+              }
+            });
+            removals.forEach((fragment) => {
+              state.stream.fading.delete(fragment);
+              state.stream.fragments.delete(fragment.id);
+            });
           }
 
           requestAnimationFrame(render);
@@ -258,250 +942,90 @@
           state.clusterMap.clear();
           state.activeCluster = null;
           state.colorCursor = 0;
+          state.pendingLineY = null;
+          state.pendingLineTargetY = null;
+          state.stream.entries = [];
+          state.stream.fragments.clear();
+          state.stream.fading.clear();
+          state.stream.lastDiff = null;
+          state.stream.nextId = 0;
           layoutClusters();
         };
 
-        const updateClusterFromResult = (cluster, transcript, isFinal) => {
-          const normalized = transcript.toLowerCase();
 
-          if (isFinal) {
-            if (
-              !cluster.isFinal ||
-              cluster.finalText !== normalized ||
-              cluster.finalRaw !== transcript
-            ) {
-              cluster.finalText = normalized;
-              cluster.finalRaw = transcript;
-              cluster.interimText = '';
-              cluster.interimRaw = '';
-            }
-          } else {
-            if (cluster.isFinal) {
-              cluster.finalText = '';
-              cluster.finalRaw = '';
-            }
-            if (
-              cluster.interimText !== normalized ||
-              cluster.interimRaw !== transcript
-            ) {
-              cluster.interimText = normalized;
-              cluster.interimRaw = transcript;
-            }
-          }
-
-          cluster.isFinal = isFinal;
-          cluster.text = cluster.finalText + (cluster.isFinal ? '' : cluster.interimText);
-          cluster.displayText =
-            (cluster.finalRaw || '') +
-            (cluster.isFinal ? '' : cluster.interimRaw || '');
-        };
-
+        /** Normalize a SpeechRecognition event payload back into stream + cluster state. */
         const handleResultEvent = (event) => {
-          const segments = [];
-          for (let i = 0; i < event.results.length; i += 1) {
-            const result = event.results[i];
-            if (!result || !result[0]) {
-              segments.push({
-                index: i,
-                transcript: '',
-                normalized: '',
-                isFinal: result ? result.isFinal === true : false,
-              });
-              continue;
-            }
-            const transcript = result[0].transcript || '';
-            segments.push({
-              index: i,
-              transcript,
-              normalized: transcript.toLowerCase(),
-              isFinal: result.isFinal === true,
-            });
-          }
-
+          const segments = buildSegmentsFromEvent(event);
           if (!segments.length) {
             return;
           }
 
-          const oldClusters = state.clusters.slice();
-          const oldMap = new Map();
-          const oldSnapshots = new Map();
-          const consumedChars = new Map();
+          const { chars, ranges } = buildStreamDescriptors(segments);
+          diffStreamEntries({ chars, ranges });
 
-          oldClusters.forEach((cluster) => {
-            oldMap.set(cluster.id, cluster);
-            consumedChars.set(cluster.id, 0);
-            oldSnapshots.set(cluster.id, {
-              normalized: (cluster.text || '').toLowerCase(),
-              position: {
-                x: cluster.x,
-                y: cluster.y,
-                railY: cluster.railY,
-              },
-            });
-          });
-
-          const usedOldClusters = new Set();
-          const plans = [];
-
-          const attemptSplitFromSource = (sourceId, charCount, normalizedText) => {
-            if (!oldSnapshots.has(sourceId)) {
-              return null;
-            }
-            const snapshot = oldSnapshots.get(sourceId);
-            const sourceCluster = oldMap.get(sourceId);
-            if (!snapshot || !sourceCluster) {
-              return null;
-            }
-            const totalChars = snapshot.normalized.length;
-            const alreadyUsed = consumedChars.get(sourceId) ?? 0;
-            if (alreadyUsed >= totalChars || !charCount) {
-              return null;
-            }
-            if (alreadyUsed + charCount > totalChars) {
-              return null;
-            }
-            const slice = snapshot.normalized.slice(
-              alreadyUsed,
-              alreadyUsed + charCount
-            );
-            if (slice !== normalizedText) {
-              return null;
-            }
-            const startIndex = alreadyUsed;
-            const endIndex = alreadyUsed + charCount;
-            consumedChars.set(sourceId, endIndex);
-            return {
-              position: {
-                x:
-                  (snapshot.position?.x ?? config.railPadding) +
-                  startIndex * withGlyphWidth(),
-                y: snapshot.position?.y ?? state.metrics.railY,
-                railY: snapshot.position?.railY ?? state.metrics.railY,
-              },
-            };
+          const clusters = [];
+          const clusterMap = new Map();
+          const diffMeta = state.stream.lastDiff || {
+            createdIds: new Set(),
+            reusedIds: new Set(),
           };
-
-          segments.forEach((segment) => {
-            const normalized = segment.normalized;
-            const charCount = normalized.length;
-            const plan = {
-              index: segment.index,
-              transcript: segment.transcript,
-              normalized,
+          segments.forEach((segment, idx) => {
+            const range = ranges[idx];
+            if (!range) {
+              return;
+            }
+            if (range.start === range.end) {
+              return;
+            }
+            const color =
+              state.clusterMap.get(segment.index)?.color ?? nextClusterColor();
+          const cluster = {
+            id: segment.index,
+            startIndex: range.start,
+            endIndex: range.end,
+            renderOffset: 0,
+              color,
               isFinal: segment.isFinal,
-              cluster: null,
-              initialPosition: null,
-              color: null,
+              displayText: segment.trimmedTranscript || segment.rawTranscript || '',
+              finalTargetY: null,
+              pendingTargetY: null,
+              targetY: null,
+              y: state.clusterMap.get(segment.index)?.y,
+              railY: state.clusterMap.get(segment.index)?.railY ?? state.metrics.railY,
+              spawnY: state.clusterMap.get(segment.index)?.spawnY ?? null,
+              hasSpawned: state.clusterMap.get(segment.index)?.hasSpawned ?? false,
+              pendingInitialDistance:
+                state.clusterMap.get(segment.index)?.pendingInitialDistance ?? null,
+              finalInitialDistance:
+                state.clusterMap.get(segment.index)?.finalInitialDistance ?? null,
             };
-
-            const existing = oldMap.get(segment.index);
-            if (existing && !usedOldClusters.has(segment.index)) {
-              plan.cluster = existing;
-              plan.initialPosition = {
-                x: existing.x,
-                y: existing.y,
-                railY: existing.railY,
-              };
-              plan.color = existing.color || nextClusterColor();
-              usedOldClusters.add(segment.index);
-              const snapshot = oldSnapshots.get(segment.index);
-              const availableLength = snapshot ? snapshot.normalized.length : 0;
-              consumedChars.set(
-                segment.index,
-                Math.min(charCount, availableLength)
-              );
-            } else if (segment.index > 0) {
-              let splitInfo = null;
-              for (let source = segment.index - 1; source >= 0; source -= 1) {
-                splitInfo = attemptSplitFromSource(source, charCount, normalized);
-                if (splitInfo) {
-                  usedOldClusters.add(source);
-                  break;
-                }
+            const stats = { created: 0, reused: 0 };
+            for (let pos = range.start; pos < range.end; pos += 1) {
+              const entry = state.stream.entries[pos];
+              if (!entry || !isRenderableChar(entry.char)) {
+                continue;
               }
-              if (splitInfo) {
-                plan.initialPosition = splitInfo.position;
-                plan.color = nextClusterColor();
-              } else {
-                plan.initialPosition = {
-                  x: config.railPadding,
-                  y: state.metrics.railY,
-                  railY: state.metrics.railY,
-                };
-                plan.color = nextClusterColor();
+              if (diffMeta.createdIds?.has(entry.id)) {
+                stats.created += 1;
               }
-            } else {
-              plan.initialPosition = {
-                x: config.railPadding,
-                y: state.metrics.railY,
-                railY: state.metrics.railY,
-              };
-              plan.color = nextClusterColor();
+              if (diffMeta.reusedIds?.has(entry.id)) {
+                stats.reused += 1;
+              }
             }
-
-            plans.push(plan);
+            cluster.fragmentStats = stats;
+            clusters.push(cluster);
+            clusterMap.set(cluster.id, cluster);
           });
 
-          oldClusters
-            .map((cluster) => cluster.id)
-            .filter((id) => !usedOldClusters.has(id))
-            .forEach((orphanId) => {
-              if (!plans.length) {
-                return;
-              }
-              const targetIndex = Math.min(orphanId, plans.length - 1);
-              const plan = plans[targetIndex];
-              const orphanCluster = oldMap.get(orphanId);
-              if (!plan) {
-                return;
-              }
-              if (orphanCluster) {
-                orphanCluster.y = orphanCluster.railY;
-              }
-            });
-
-          plans.sort((a, b) => a.index - b.index);
-
-          const newClusters = [];
-          const newMap = new Map();
-          let latestActive = null;
-
-          plans.forEach((plan) => {
-            let cluster = plan.cluster;
-            if (cluster) {
-              cluster.id = plan.index;
-              cluster.x = plan.initialPosition?.x ?? cluster.x;
-              cluster.y = plan.initialPosition?.y ?? cluster.y;
-              cluster.railY = plan.initialPosition?.railY ?? cluster.railY;
-              if (!cluster.color) {
-                cluster.color = plan.color || nextClusterColor();
-              }
-            } else {
-              cluster = createCluster(plan.index, {
-                x: plan.initialPosition?.x,
-                y: plan.initialPosition?.y,
-                railY: plan.initialPosition?.railY,
-                color: plan.color,
-              });
-            }
-
-            updateClusterFromResult(cluster, plan.transcript, plan.isFinal);
-
-            newClusters.push(cluster);
-            newMap.set(plan.index, cluster);
-            if (!cluster.isFinal) {
-              latestActive = cluster;
-            }
-          });
-
-          state.clusters = newClusters;
-          state.clusterMap = newMap;
+          state.clusters = clusters;
+          state.clusterMap = clusterMap;
           layoutClusters();
-          state.activeCluster =
-            latestActive ||
-            (newClusters.length ? newClusters[newClusters.length - 1] : null);
+          state.activeCluster = clusters.find((cluster) => !cluster.isFinal) || null;
+
+          logRecognitionSnapshot();
         };
 
+        /** Bootstrap the SpeechRecognition engine and wire event handlers. */
         const setupRecognition = () => {
           if (!SpeechRecognition) {
             warn('Web Speech API is not supported in this browser. Demo idle.');
@@ -557,6 +1081,7 @@
           updateButtonUI({ disabled: false });
         };
 
+        /** Begin audio capture if recognition is idle. */
         const startRecognition = () => {
           if (!state.recognition) {
             error('Speech recognition unavailable.');
@@ -581,6 +1106,7 @@
           }
         };
 
+        /** Halt the active recognition session while respecting restart flags. */
         const stopRecognition = () => {
           if (!state.recognition) {
             error('Speech recognition unavailable.');
@@ -605,12 +1131,52 @@
         setupRecognition();
         if (button) {
           button.addEventListener('click', () => {
-            if (state.isListening) {
-              stopRecognition();
-            } else {
-              startRecognition();
-            }
+          if (state.isListening) {
+            stopRecognition();
+          } else {
+            startRecognition();
+          }
+        });
+
+        if (randomToggle) {
+          randomToggle.addEventListener('change', () => {
+            config.fragmentRandomizationEnabled = randomToggle.checked;
+            state.stream.fragments.forEach((fragment) => {
+              if (config.fragmentRandomizationEnabled) {
+                ensureFragmentRandomization(fragment);
+              } else {
+                fragment.offsetX = 0;
+                fragment.offsetY = 0;
+                fragment.rotation = 0;
+                fragment.speedMultiplier = 1;
+              }
+            });
           });
+        }
+
+        if (fragmentBoundsToggle) {
+          fragmentBoundsToggle.addEventListener('change', () => {
+            config.showFragmentBounds = fragmentBoundsToggle.checked;
+          });
+        }
+
+        if (slotBoundsToggle) {
+          slotBoundsToggle.addEventListener('change', () => {
+            config.showSlotBounds = slotBoundsToggle.checked;
+          });
+        }
+
+        if (slotVectorToggle) {
+          slotVectorToggle.addEventListener('change', () => {
+            config.showSlotVectors = slotVectorToggle.checked;
+          });
+        }
+
+        if (colorCodingToggle) {
+          colorCodingToggle.addEventListener('change', () => {
+            config.colorCodingEnabled = colorCodingToggle.checked;
+          });
+        }
         }
 
         state.lastFrameTime = performance.now();
